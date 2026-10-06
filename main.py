@@ -1,3 +1,4 @@
+import csv
 import logging
 import re
 import time
@@ -9,11 +10,12 @@ from playwright.sync_api import sync_playwright
 
 BASE = Path(__file__).parent
 LINK = "https://dbc-f0bcd00e-80e9.cloud.databricks.com/"
-PERFIL = BASE / "perfil_navegador"   # perfil do navegador (guarda a sessão)
+PERFIL = BASE / "perfil_navegador"        # perfil do navegador (guarda a sessão)
 PASTA_SAIDA = BASE / "resultados"
 PASTA_LOGS = BASE / "logs"
+PASTA_DOWNLOADS = BASE / "downloads_tmp"  # downloads ficam no disco (recuperáveis)
 
-MAX_TENTATIVAS = 3   # quantas vezes tentar cada query antes de desistir
+MAX_TENTATIVAS = 1   # 1 = sem repetição (bom para diagnosticar); depois, 2
 
 # Queries a baixar: o INÍCIO do nome salvo no Databricks
 QUERIES = [
@@ -21,8 +23,8 @@ QUERIES = [
     "teste_queries_3",
 ]
 
-PASTA_SAIDA.mkdir(exist_ok=True)
-PASTA_LOGS.mkdir(exist_ok=True)
+for pasta in (PASTA_SAIDA, PASTA_LOGS, PASTA_DOWNLOADS):
+    pasta.mkdir(exist_ok=True)
 PERFIL.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -34,7 +36,7 @@ logging.basicConfig(
 
 
 class SessaoExpirada(Exception):
-    """Login expirado: repetir a tentativa não adianta."""
+    """Login expirado: seguir com as outras queries não adianta."""
 
 
 def nome_arquivo(texto):
@@ -50,10 +52,67 @@ def tirar_print(page, nome):
         logging.warning("Print não tirado: navegador já fechado")
 
 
+def registrar_eventos(contexto, page):
+    """Diagnóstico: grava no log o que acontece com o navegador."""
+
+    def ao_abrir_aba(nova):
+        logging.info("EVENTO: aba aberta")
+        nova.on("close", lambda *_: logging.warning("EVENTO: aba extra fechou"))
+
+    contexto.on("page", ao_abrir_aba)
+    contexto.on("close", lambda *_: logging.warning("EVENTO: contexto fechou"))
+    page.on("close", lambda *_: logging.warning("EVENTO: página principal fechou"))
+    page.on("crash", lambda *_: logging.error("EVENTO: página travou (crash)"))
+    page.on(
+        "download",
+        lambda d: logging.info(f"EVENTO: download iniciado: {d.suggested_filename}"),
+    )
+
+
+def limpar_downloads_antigos(dias=1):
+    """Apaga arquivos antigos de downloads_tmp para a pasta não crescer."""
+    limite = time.time() - dias * 86400
+    for f in PASTA_DOWNLOADS.iterdir():
+        if f.is_file() and f.stat().st_mtime < limite:
+            f.unlink(missing_ok=True)
+
+
+def csv_completo(caminho):
+    """Confere se todas as linhas têm o mesmo número de colunas do cabeçalho."""
+    with open(caminho, newline="", encoding="utf-8-sig") as f:
+        linhas = list(csv.reader(f))
+    return len(linhas) > 1 and all(len(l) == len(linhas[0]) for l in linhas)
+
+
+def recuperar_download(destino, desde):
+    """Procura em downloads_tmp o arquivo baixado após 'desde' e o copia."""
+    candidatos = [
+        f for f in PASTA_DOWNLOADS.iterdir()
+        if f.is_file() and f.stat().st_mtime >= desde - 1
+    ]
+    if not candidatos:
+        raise RuntimeError("Nenhum arquivo baixado encontrado em downloads_tmp")
+
+    arquivo = max(candidatos, key=lambda f: f.stat().st_mtime)
+    logging.info(f"Arquivo encontrado: {arquivo.name} ({arquivo.stat().st_size} bytes)")
+
+    if not csv_completo(arquivo):
+        raise RuntimeError("Arquivo baixado parece incompleto")
+
+    destino.write_bytes(arquivo.read_bytes())
+    arquivo.unlink(missing_ok=True)
+    logging.warning(f"Arquivo recuperado de downloads_tmp para {destino}")
+
+
+def link_queries(page):
+    """Link 'Queries' do menu lateral (evita bater em links de abas abertas)."""
+    return page.get_by_test_id("UnifiedSideNav").get_by_role("link", name="Queries")
+
+
 def verificar_login(page):
     """Confirma que a sessão está ativa; senão, falha com mensagem clara."""
     try:
-        page.get_by_role("link", name="Queries").wait_for(timeout=15000)
+        link_queries(page).wait_for(timeout=15000)
     except Exception:
         tirar_print(page, "sessao_expirada")
         raise SessaoExpirada(
@@ -63,9 +122,9 @@ def verificar_login(page):
 
 def baixar_resultado(page, nome_query, destino):
     """Abre a query salva pelo nome, executa e salva o CSV em 'destino'."""
-    page.get_by_role("link", name="Queries").click()
+    link_queries(page).click()
     page.get_by_role(
-        "link", name=re.compile(re.escape(nome_query))
+        "link", name=re.compile(rf"^{re.escape(nome_query)}")
     ).click()
 
     # Executa a query
@@ -86,13 +145,18 @@ def baixar_resultado(page, nome_query, destino):
     page.get_by_test_id(re.compile(r"^MoreViz")).click(timeout=60000)
     page.get_by_test_id(re.compile(r"^CommandResultTabDownloadCSV")).click()
 
+    inicio_download = time.time()
     with page.expect_download(timeout=120000) as download_info:
         page.get_by_test_id(
             re.compile(r"^CommandResultTabDownloadPreviewCSV")
         ).click()
 
-    # Salva na hora, com o navegador ainda aberto
-    download_info.value.save_as(destino)
+    # Salva na hora; se o navegador caiu, tenta recuperar o arquivo do disco
+    try:
+        download_info.value.save_as(destino)
+    except Exception:
+        logging.warning("save_as falhou; tentando recuperar o arquivo do disco")
+        recuperar_download(destino, inicio_download)
 
 
 def baixar_uma_query(p, nome, destino):
@@ -102,12 +166,17 @@ def baixar_uma_query(p, nome, destino):
         channel="msedge",
         headless=False,
         accept_downloads=True,
+        downloads_path=PASTA_DOWNLOADS,
         no_viewport=True,
         args=["--start-maximized"],
     )
+    contexto.set_default_timeout(60000)
+    contexto.set_default_navigation_timeout(60000)
+
     page = None
     try:
         page = contexto.new_page()
+        registrar_eventos(contexto, page)
         page.goto(LINK)
         verificar_login(page)
         baixar_resultado(page, nome, destino)
@@ -120,45 +189,45 @@ def baixar_uma_query(p, nome, destino):
             contexto.close()
         except Exception:
             pass
+        time.sleep(3)   # dá tempo de o perfil ser liberado
 
 
 def main():
     logging.info("Início da execução")
+    limpar_downloads_antigos()
 
     data = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    pendentes = list(QUERIES)
-    tentativas = {q: 0 for q in QUERIES}
     concluidas = []
     falhas = []
 
     with sync_playwright() as p:
-        while pendentes:
-            nome = pendentes.pop(0)
-            tentativas[nome] += 1
+        for nome in QUERIES:
             destino = PASTA_SAIDA / f"{nome_arquivo(nome)}_{data}.csv"
 
-            logging.info(
-                f"Query '{nome}' (tentativa {tentativas[nome]}/{MAX_TENTATIVAS})"
-            )
-            try:
-                baixar_uma_query(p, nome, destino)
-                concluidas.append(nome)
-                logging.info(f"Arquivo salvo em {destino}")
-                print(f"Arquivo salvo em {destino}")
+            for tentativa in range(1, MAX_TENTATIVAS + 1):
+                msg = f"Query '{nome}' (tentativa {tentativa}/{MAX_TENTATIVAS})"
+                logging.info(msg)
+                print(msg)
 
-            except SessaoExpirada:
-                logging.exception("Sessão expirada: execução interrompida")
-                raise
+                try:
+                    baixar_uma_query(p, nome, destino)
+                    concluidas.append(nome)
+                    logging.info(f"Arquivo salvo em {destino}")
+                    print(f"Arquivo salvo em {destino}")
+                    break   # deu certo: sai das tentativas desta query
 
-            except Exception:
-                logging.exception(f"Falha na query: {nome}")
-                if tentativas[nome] < MAX_TENTATIVAS:
-                    pendentes.append(nome)   # volta para o fim da fila
-                else:
-                    falhas.append(nome)
-                    logging.error(f"Desistindo de '{nome}' após {MAX_TENTATIVAS} tentativas")
+                except SessaoExpirada:
+                    logging.exception("Sessão expirada: execução interrompida")
+                    raise
 
-            time.sleep(3)   # dá tempo de o perfil ser liberado antes da próxima
+                except Exception as e:
+                    logging.exception(f"Falha na query: {nome}")
+                    primeira_linha = (str(e).splitlines() or [""])[0]
+                    print(f"FALHOU: {nome} -> {type(e).__name__}: {primeira_linha}")
+            else:
+                # só executa se NENHUMA tentativa deu certo (sem 'break')
+                falhas.append(nome)
+                logging.error(f"Desistindo de '{nome}' após {MAX_TENTATIVAS} tentativa(s)")
 
     logging.info(f"Concluídas: {concluidas} | Falhas: {falhas}")
 
