@@ -1,0 +1,22 @@
+# Ambiente virtual
+venv/
+
+# Sessão do navegador (guarda cookies do seu login)
+perfil_navegador/
+perfil_chromium/
+
+# Saídas do script
+resultados/
+logs/
+downloads_tmp/
+
+# Credenciais (caso use .env em algum script)
+.env
+
+# Gravações do codegen (têm URLs e IDs da sua conta)
+gravacao.py
+record.py
+
+# Cache do Python
+__pycache__/
+*.pyc
